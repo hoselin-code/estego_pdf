@@ -1,0 +1,202 @@
+#!/usr/bin/python3
+import sys
+import os
+import select
+import argparse
+import getpass
+
+from pdfhide import logger
+from pdfhide import pdf_algo
+from pdfhide import image_handler
+
+#
+# pdf_hide v0.1 — steganographic tool for hiding data in PDF files
+# Image support added in v0.1
+#
+
+__version__ = "0.1"
+
+
+def build_stego(args, rl):
+	"""Instantiate PDF_stego from parsed CLI args."""
+	return pdf_algo.PDF_stego(
+		args.filename,
+		rl,
+		output=args.output,
+		improve=args.improve,
+		red=args.red,
+		nbits=args.nbits,
+		customrange=args.customrange
+	)
+
+
+def action_embed(args, rl):
+	"""Embed a text/binary data file into a PDF."""
+	ps = build_stego(args, rl)
+	payload = args.data.read()
+	result = ps.embed(payload, args.key, norandom=args.norandom)
+	if result > 0:
+		logger.print_end()
+		exit(0)
+	exit(result)
+
+
+def action_embed_image(args, rl):
+	"""Wrap an image file in a pdf_hide envelope then embed it into a PDF."""
+	image_path = args.image
+	if not os.path.isfile(image_path):
+		rl.error("Image file not found: " + image_path)
+		exit(1)
+
+	ext = image_handler.get_extension_from_path(image_path)
+	if not ext:
+		rl.error(
+			"Cannot determine image extension from filename. "
+			"Please rename the file with a proper extension (e.g. photo.png)."
+		)
+		exit(1)
+
+	rl.info("Image file: \"" + image_path + "\" (." + ext + ")")
+
+	with open(image_path, "rb") as f:
+		image_bytes = f.read()
+
+	rl.info("Image size: " + str(len(image_bytes)) + " bytes (original)")
+	envelope = image_handler.wrap(image_bytes, ext)
+	rl.info("Envelope size: " + str(len(envelope)) + " bytes (after compression)")
+
+	ps = build_stego(args, rl)
+	result = ps.embed(envelope, args.key, norandom=args.norandom)
+	if result > 0:
+		logger.print_end()
+		exit(0)
+	exit(result)
+
+
+def action_extract(args, rl):
+	"""Extract data from a PDF; auto-detect images and save with correct extension."""
+	if args.customrange:
+		args.nbits = min(args.nbits, 6)
+
+	ps = build_stego(args, rl)
+	result = ps.extract(args.key)
+
+	if result == 0:
+		try:
+			with open(args.output, "rb") as f:
+				raw = f.read()
+		except OSError:
+			logger.print_end()
+			exit(0)
+
+		if image_handler.is_image_envelope(raw):
+			try:
+				image_bytes, extension = image_handler.unwrap(raw)
+			except ValueError as e:
+				rl.error("Failed to unwrap image envelope: " + str(e))
+				exit(1)
+
+			base, _ = os.path.splitext(args.output)
+			image_output = base + "." + extension
+			with open(image_output, "wb") as f:
+				f.write(image_bytes)
+
+			# Remove the raw envelope file if different from the image output path
+			if os.path.abspath(args.output) != os.path.abspath(image_output):
+				try:
+					os.remove(args.output)
+				except OSError:
+					pass
+
+			rl.info("Extracted image (" + extension.upper() + "): \"" + image_output + "\"")
+			rl.info("Image size: " + str(len(image_bytes)) + " bytes")
+		else:
+			rl.info("Extracted data (text/binary): \"" + args.output + "\"")
+
+		logger.print_end()
+
+	exit(result)
+
+
+def main():
+	parser = argparse.ArgumentParser(
+		prog="pdf_hide",
+		formatter_class=argparse.RawDescriptionHelpFormatter,
+		description=logger.MSG_DESC,
+		epilog=logger.MSG_LICENSE
+	)
+	subparsers = parser.add_subparsers(title="actions", dest="action", help="action to execute")
+
+	# General arguments
+	parser.add_argument("filename", help="PDF file (may be compressed) to use as input")
+	parser.add_argument("-o", "--output", dest="output", default="out.pdf_hide",
+		help="use FILENAME as the output file", metavar="FILENAME")
+	parser.add_argument("-k", "--key", dest="key", help="use KEY as the stego-key", metavar="KEY")
+
+	# embed (text / arbitrary binary)
+	parser_embed = subparsers.add_parser("embed", aliases=["m"],
+		help="Embed a data file (text or binary) inside a PDF file")
+	parser_embed.add_argument("data", type=argparse.FileType("rb"),
+		help="the data file to embed (or stdin)")
+	parser_embed.add_argument("--no-random", action="store_true", dest="norandom", default=False,
+		help="do not embed random values, keep original ones")
+
+	# embed-image
+	parser_embed_img = subparsers.add_parser("embed-image", aliases=["mi"],
+		help="Embed an image (PNG, JPEG, BMP, GIF, WEBP, …) inside a PDF file")
+	parser_embed_img.add_argument("image", help="path to the image file to embed")
+	parser_embed_img.add_argument("--no-random", action="store_true", dest="norandom", default=False,
+		help="do not embed random values, keep original ones")
+
+	# extract
+	subparsers.add_parser("extract", aliases=["x"],
+		help="Extract data from a PDF file (images are saved with their original extension)")
+
+	# Algorithm options
+	group_options = parser.add_argument_group("algorithm options",
+		"use these options to tune the algorithm")
+	group_options.add_argument("-n", "--nbits", action="store", dest="nbits", type=int, default=4,
+		help="use NBITS as the number of bits to use for numerals", metavar="NBITS")
+	group_options.add_argument("-r", "--redundancy", action="store", dest="red", type=float, default=0.1,
+		help="use RED as the redundancy parameter (strictly between 0 and 1)", metavar="RED")
+	parser.add_argument("-i", "--improve", action="store_true", dest="improve", default=False,
+		help="use algo improvements")
+	parser.add_argument("--custom-range", action="store_true", dest="customrange", default=False,
+		help="use data in [-450,-250] without -333 and -334")
+
+	# Verbosity
+	group_verb = parser.add_mutually_exclusive_group()
+	group_verb.add_argument("-v", "--verbose", action="count", dest="verbose", default=0,
+		help="set verbosity level")
+	group_verb.add_argument("-q", "--quiet", action="store_const", dest="verbose", const=-1,
+		help="force quiet output")
+
+	# Version
+	group_version = parser.add_argument_group("version")
+	group_version.add_argument("--version", action="version", version=logger.MSG_VERSION)
+
+	args = parser.parse_args()
+	rl = logger.rootLogger(args.verbose)
+
+	if args.verbose >= 0:
+		logger.print_splash()
+		if args.verbose > 0:
+			logger.print_discl()
+
+	if args.action in ("embed", "m", "embed-image", "mi", "extract", "x"):
+		if args.key is None:
+			args.key = getpass.getpass("Please enter key: ")
+
+	if args.action in ("embed", "m"):
+		action_embed(args, rl)
+	elif args.action in ("embed-image", "mi"):
+		action_embed_image(args, rl)
+	elif args.action in ("extract", "x"):
+		action_extract(args, rl)
+	else:
+		parser.print_help()
+		exit(1)
+
+
+if __name__ == '__main__':
+	main()
